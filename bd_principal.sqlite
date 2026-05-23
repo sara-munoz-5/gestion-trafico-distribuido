@@ -1,0 +1,188 @@
+"""
+semaforos.py — Servicio de Control de Semáforos (PC2)
+
+Mantiene 16 semáforos simulados (cuadrícula 4×4: INT_A1 … INT_D4).
+Recibe comandos del Servicio de Analítica por PULL y los ejecuta.
+Un hilo de temporización cambia el estado automáticamente cada segundo.
+
+Uso:
+    python semaforos.py
+    python semaforos.py --config ../../config.json
+"""
+import zmq
+import json
+import time
+import threading
+import argparse
+import signal
+import sys
+import os
+
+ROOT = os.path.join(os.path.dirname(__file__), "..")
+sys.path.insert(0, ROOT)
+from shared.modelos import ts_now
+
+
+class Semaforo:
+    """Semáforo inteligente: solo VERDE y ROJO (sin amarillo, según enunciado)."""
+
+    def __init__(self, interseccion: str, t_verde: int = 15, t_rojo: int = 15):
+        """Crea un semáforo con tiempos base y estado inicial en rojo."""
+        self.interseccion   = interseccion
+        self.estado         = "ROJO"
+        self.t_verde        = t_verde
+        self.t_rojo         = t_rojo
+        self.tiempo_restante = t_rojo
+        self._lock          = threading.Lock()
+
+    def _cambiar(self, nuevo_estado: str, duracion: int, motivo: str) -> None:
+        """Aplica transición de estado explícita y reinicia temporizador local."""
+        with self._lock:
+            if self.estado != nuevo_estado:
+                anterior = self.estado
+                self.estado          = nuevo_estado
+                self.tiempo_restante = duracion
+                print(f"[SEMÁFORO] {ts_now()} {self.interseccion}: "
+                      f"{anterior} → {nuevo_estado} ({duracion}s) [{motivo}]")
+
+    def a_verde(self, duracion: int = None, motivo: str = "COMANDO") -> None:
+        """Pasa el semáforo a verde usando duración indicada o la base."""
+        self._cambiar("VERDE", duracion or self.t_verde, motivo)
+
+    def a_rojo(self, duracion: int = None, motivo: str = "COMANDO") -> None:
+        """Pasa el semáforo a rojo usando duración indicada o la base."""
+        self._cambiar("ROJO", duracion or self.t_rojo, motivo)
+
+    def extender_verde(self, duracion: int, motivo: str = "CONGESTION") -> None:
+        """Extiende verde actual o fuerza cambio a verde para aliviar congestión."""
+        with self._lock:
+            if self.estado == "VERDE":
+                self.tiempo_restante = duracion
+                print(f"[SEMÁFORO] {ts_now()} {self.interseccion}: "
+                      f"VERDE extendido a {duracion}s [{motivo}]")
+            else:
+                # Si estaba en rojo, cambiar a verde con la duración indicada
+                anterior = self.estado
+                self.estado          = "VERDE"
+                self.tiempo_restante = duracion
+                print(f"[SEMÁFORO] {ts_now()} {self.interseccion}: "
+                      f"{anterior} → VERDE ({duracion}s) [{motivo}]")
+
+    def tick(self) -> None:
+        """Avanza 1 segundo; cambia estado automáticamente al llegar a 0."""
+        with self._lock:
+            self.tiempo_restante -= 1
+            if self.tiempo_restante <= 0:
+                if self.estado == "VERDE":
+                    self.estado          = "ROJO"
+                    self.tiempo_restante = self.t_rojo
+                    print(f"[SEMÁFORO] {ts_now()} {self.interseccion}: "
+                          f"VERDE → ROJO (automático, {self.t_rojo}s)")
+                else:
+                    self.estado          = "VERDE"
+                    self.tiempo_restante = self.t_verde
+                    print(f"[SEMÁFORO] {ts_now()} {self.interseccion}: "
+                          f"ROJO → VERDE (automático, {self.t_verde}s)")
+
+
+class ServicioControlSemaforos:
+
+    def __init__(self, cfg: dict):
+        """Inicializa cuadrícula 4x4, socket PULL y estado del servicio."""
+        self.cfg = cfg
+        self.red = cfg["red"]
+        t_verde  = cfg["semaforos"]["tiempo_verde_normal_seg"]
+        t_rojo   = cfg["semaforos"]["tiempo_rojo_normal_seg"]
+
+        # Crear un semáforo por cada intersección de la cuadrícula 4×4
+        self.semaforos: dict[str, Semaforo] = {}
+        for fila in cfg["ciudad"]["filas"]:       # A, B, C, D
+            for col in cfg["ciudad"]["columnas"]:  # 1, 2, 3, 4
+                inter = f"INT_{fila}{col}"
+                self.semaforos[inter] = Semaforo(inter, t_verde, t_rojo)
+
+        # Socket PULL: recibe comandos de Analítica
+        self.ctx  = zmq.Context()
+        self.pull = self.ctx.socket(zmq.PULL)
+        self.pull.connect(f"tcp://127.0.0.1:{self.red['semaforos_port']}")
+
+        self.activo = True
+        print(f"[SEMÁFOROS] {ts_now()} — "
+              f"{len(self.semaforos)} semáforos inicializados (cuadrícula 4×4)")
+        print(f"[SEMÁFOROS] Intersecciones: {', '.join(self.semaforos.keys())}")
+
+    def ejecutar_comando(self, msg: str) -> None:
+        """Decodifica y ejecuta comandos recibidos desde Analítica."""
+        try:
+            cmd = json.loads(msg)
+        except Exception:
+            print(f"[SEMÁFOROS] ERROR: Mensaje inválido")
+            return
+
+        inter  = cmd.get("interseccion")
+        accion = cmd.get("accion")
+        dur    = cmd.get("duracion_seg", 15)
+        origen = cmd.get("origen", "?")
+
+        if inter not in self.semaforos:
+            print(f"[SEMÁFOROS] WARN: Intersección desconocida → {inter}")
+            return
+
+        sem = self.semaforos[inter]
+        if accion == "VERDE":
+            sem.a_verde(dur, origen)
+        elif accion == "ROJO":
+            sem.a_rojo(dur, origen)
+        elif accion == "EXTENDER_VERDE":
+            sem.extender_verde(dur, origen)
+        else:
+            print(f"[SEMÁFOROS] WARN: Acción desconocida → {accion}")
+
+    def hilo_pull(self) -> None:
+        """Loop no bloqueante que consume comandos de control por ZeroMQ."""
+        while self.activo:
+            try:
+                msg = self.pull.recv_string(flags=zmq.NOBLOCK)
+                self.ejecutar_comando(msg)
+            except zmq.ZMQError:
+                time.sleep(0.05)
+
+    def hilo_temporizador(self) -> None:
+        """Avanza el contador de todos los semáforos cada segundo."""
+        while self.activo:
+            time.sleep(1)
+            for sem in self.semaforos.values():
+                sem.tick()
+
+    def iniciar(self) -> None:
+        """Arranca hilos del servicio y registra cierre limpio con Ctrl+C."""
+        hilos = [
+            threading.Thread(target=self.hilo_pull,        daemon=True),
+            threading.Thread(target=self.hilo_temporizador, daemon=True),
+        ]
+        for h in hilos:
+            h.start()
+
+        def apagar(sig, frame):
+            print("\n[SEMÁFOROS] Deteniendo...")
+            self.activo = False
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, apagar)
+        print("[SEMÁFOROS] Hilos activos. Ctrl+C para detener.")
+        for h in hilos:
+            h.join()
+
+
+def main():
+    """Punto de entrada CLI para iniciar el servicio de semáforos."""
+    parser = argparse.ArgumentParser(description="Servicio de Control de Semáforos")
+    parser.add_argument("--config", default="../config.json")
+    args = parser.parse_args()
+    with open(args.config) as f:
+        cfg = json.load(f)
+    ServicioControlSemaforos(cfg).iniciar()
+
+
+if __name__ == "__main__":
+    main()
